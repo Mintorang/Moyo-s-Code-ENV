@@ -55,14 +55,6 @@ from alpaca.trading.requests import (
     StopLossRequest,
     TakeProfitRequest,
 )
-import os
-from dotenv import load
-
-load_dotenv()
-
-BASE_URL = os.getenv("APCA_API_BASE_URL")
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 
 ET = ZoneInfo("America/New_York")
 OPEN_MOD = 9 * 60 + 30  # minutes since midnight
@@ -457,47 +449,47 @@ def run(args):
     log.info("Mode: %s%s", "LIVE" if args.live else "PAPER", " (dry-run)" if args.dry_run else "")
 
     last_universe: tuple[float, list[str], set[str]] = (0.0, [], set())
-    while True:
-        try:
-            clock = tc.get_clock()
-            now = datetime.now(ET)
-            if not clock.is_open:
-                log.info("Market closed. Next open %s", clock.next_open)
-                time.sleep(300)
-                continue
-            trader.reset_if_new_day(now.date())
+    
+      try:
+          clock = tc.get_clock()
+          now = datetime.now(ET)
+          if not clock.is_open:
+              log.info("Market closed. Next open %s", clock.next_open)
+              time.sleep(300)
+              continue
+          trader.reset_if_new_day(now.date())
 
-            if now.time() >= cfg.flatten_at:
-                trader.flatten()
-                time.sleep(600)
-                continue
+          if now.time() >= cfg.flatten_at:
+              trader.flatten()
+              time.sleep(600)
+              continue
 
-            if time.time() - last_universe[0] > 300:
-                syms, scanned = data.universe(watch)
-                last_universe = (time.time(), syms, scanned)
-                log.info("Universe (%d, %d scanned): %s", len(syms), len(scanned), ", ".join(syms))
+          if time.time() - last_universe[0] > 300:
+              syms, scanned = data.universe(watch)
+              last_universe = (time.time(), syms, scanned)
+              log.info("Universe (%d, %d scanned): %s", len(syms), len(scanned), ", ".join(syms))
 
-            if (not trader.daily_loss_hit() and trader.trades_today < cfg.max_trades_per_day):
-                busy = trader.busy_symbols()
-                open_slots = cfg.max_open_positions - len({p.symbol for p in tc.get_all_positions()})
-                for ctx in data.contexts(last_universe[1], now, last_universe[2]):
-                    if open_slots <= 0 or ctx.symbol in busy or ctx.symbol in trader.done:
-                        continue
-                    if ctx.screened and not ctx.rvol >= cfg.screen_min_rvol:
-                        continue  # scanned names must show RVOL > 2; seed names are always eligible
-                    for strat in STRATEGIES:
-                        sig = strat(ctx, cfg)
-                        if sig:
-                            trader.submit(sig)
-                            open_slots -= 1
-                            break
-        except KeyboardInterrupt:
-            log.info("Stopped by user")
-            return
-        except Exception as e:
-            log.exception("loop error: %s", e)
-        # wake a few seconds after the next minute bar closes
-        time.sleep(max(5, 63 - datetime.now().second))
+          if (not trader.daily_loss_hit() and trader.trades_today < cfg.max_trades_per_day):
+              busy = trader.busy_symbols()
+              open_slots = cfg.max_open_positions - len({p.symbol for p in tc.get_all_positions()})
+              for ctx in data.contexts(last_universe[1], now, last_universe[2]):
+                  if open_slots <= 0 or ctx.symbol in busy or ctx.symbol in trader.done:
+                      continue
+                  if ctx.screened and not ctx.rvol >= cfg.screen_min_rvol:
+                      continue  # scanned names must show RVOL > 2; seed names are always eligible
+                  for strat in STRATEGIES:
+                      sig = strat(ctx, cfg)
+                      if sig:
+                          trader.submit(sig)
+                          open_slots -= 1
+                          break
+      except KeyboardInterrupt:
+          log.info("Stopped by user")
+          return
+      except Exception as e:
+          log.exception("loop error: %s", e)
+      # wake a few seconds after the next minute bar closes
+      time.sleep(max(5, 63 - datetime.now().second))
 
 
 if __name__ == "__main__":
