@@ -55,6 +55,14 @@ from alpaca.trading.requests import (
     StopLossRequest,
     TakeProfitRequest,
 )
+import os
+from dotenv import load
+
+load_dotenv()
+
+BASE_URL = os.getenv("APCA_API_BASE_URL")
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 
 ET = ZoneInfo("America/New_York")
 OPEN_MOD = 9 * 60 + 30  # minutes since midnight
