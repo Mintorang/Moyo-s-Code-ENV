@@ -2,38 +2,28 @@
 """
 penny_trader.py - Intraday penny-stock bot (Alpaca) with 4 strategies:
 
-  1. Gap & Go           gap > 4%, RVOL > 3x, low float; ORB-5 break or VWAP pullback
+  1. Gap & Go            gap > 4%, RVOL > 3x, low float; ORB-5 break or VWAP pullback
   2. VWAP Momentum      cross above VWAP + volume spike + expanding MACD histogram
   3. Opening Range Breakout (15 min by default) with volume confirmation
   4. Panic Dip Buy      RSI < 25 on heavy volume, buy first bullish reversal, target VWAP
 
 SETUP
-  pip install alpaca-py pandas numpy yfinance        (yfinance is optional, for float data)
+  pip install alpaca-py pandas numpy yfinance
   Create a file named .env next to this script (see .env.example) with your PAPER keys.
 
-RUN
-  python penny_trader.py --dry-run                   # logs signals only, no orders
-  python penny_trader.py                             # PAPER trading (default)
+RUN (Scheduled / Single Pass via GitHub Actions)
+  python penny_trader.py --dry-run                    # logs signals only, no orders
+  python penny_trader.py                              # PAPER trading (default)
   python penny_trader.py --watchlist my_symbols.txt  # add your own tickers (one per line)
-  python penny_trader.py --live                      # REAL money (asks for confirmation)
-
-NOTES
-  * Educational software, not financial advice. Penny stocks are extremely risky.
-  * Free Alpaca data uses the IEX feed (a small slice of total volume). RVOL is computed
-    against IEX history so it is self-consistent, but absolute volumes look small.
-  * Alpaca does not trade most OTC/pink-sheet stocks; this targets exchange-listed
-    low-priced stocks ($0.50-$5).
-  * Backtest and paper trade for weeks before risking real money.
+  python penny_trader.py --live                       # REAL money (asks for confirmation)
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import logging
-import math
 import os
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
@@ -41,10 +31,9 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import DataFeed, MostActivesBy
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.historical.screener import ScreenerClient
-from alpaca.data.enums import MostActivesBy
 from alpaca.data.requests import MarketMoversRequest, MostActivesRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
@@ -62,20 +51,21 @@ log = logging.getLogger("penny")
 
 
 # --------------------------------------------------------------------------- config
-SEED_HIGH_LIQUIDITY = ["PLUG", "OPEN", "NIO", "RIG"]                 # ORB / VWAP testing
-SEED_LOW_FLOAT_MOMO = ["SOUN", "BBAI", "RGTI", "SDA", "SNDL"]         # Gap & Go
-SEED_DIP_BUY = ["ACRS", "STTK", "DBGI"]                               # Panic Dip
+SEED_HIGH_LIQUIDITY = ["PLUG", "OPEN", "NIO", "RIG"]
+SEED_LOW_FLOAT_MOMO = ["SOUN", "BBAI", "RGTI", "SDA", "SNDL"]
+SEED_DIP_BUY = ["ACRS", "STTK", "DBGI"]
 SEEDS = SEED_HIGH_LIQUIDITY + SEED_LOW_FLOAT_MOMO + SEED_DIP_BUY
 
 
 def load_env(path: str = ".env"):
     """Tiny .env loader so keys never live in the source code."""
     if os.path.exists(path):
-        for ln in open(path):
-            ln = ln.strip()
-            if ln and not ln.startswith("#") and "=" in ln:
-                k, v = ln.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        with open(path) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    k, v = ln.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 @dataclass
@@ -84,13 +74,13 @@ class Config:
     min_price: float = 0.50
     max_price: float = 5.00
     max_universe: int = 40
-    screen_min_volume: int = 1_000_000   # daily volume filter for scanned symbols
-    screen_min_rvol: float = 2.0         # RVOL filter for scanned symbols
+    screen_min_volume: int = 1_000_000
+    screen_min_rvol: float = 2.0
     # Gap & Go
     gap_min_pct: float = 4.0
     rvol_min: float = 3.0
     max_float: float = 20_000_000
-    allow_unknown_float: bool = True   # float data is often missing; set False to be strict
+    allow_unknown_float: bool = True
     gap_orb_minutes: int = 5
     # ORB
     orb_minutes: int = 15
@@ -102,14 +92,14 @@ class Config:
     dip_min_drop_pct: float = 8.0
     dip_vol_mult: float = 2.0
     # risk
-    risk_per_trade_pct: float = 0.5     # % of equity risked per trade
-    max_position_pct: float = 10.0      # max % of equity in one position
+    risk_per_trade_pct: float = 0.5
+    max_position_pct: float = 10.0
     max_open_positions: int = 3
     max_trades_per_day: int = 6
-    daily_loss_limit_pct: float = 3.0   # stop trading for the day past this drawdown
+    daily_loss_limit_pct: float = 3.0
     reward_risk: float = 2.0
-    max_stop_pct: float = 8.0           # cap stop distance
-    flatten_at: dtime = dtime(15, 50)   # close everything before the close
+    max_stop_pct: float = 8.0
+    flatten_at: dtime = dtime(15, 50)
 
 
 @dataclass
@@ -129,14 +119,14 @@ class Ctx:
     gap_pct: float
     rvol: float
     flt: Optional[float]
-    screened: bool = False   # came from the live scanner (not the fixed seed list)
+    screened: bool = False
 
 
 # --------------------------------------------------------------------------- indicators
 def add_indicators(r: pd.DataFrame) -> pd.DataFrame:
     r = r.copy()
     tp = (r.high + r.low + r.close) / 3
-    r["vwap"] = (tp * r.volume).cumsum() / r.volume.cumsum().replace(0, np.nan)
+    r["vwap"] = ((tp * r.volume).cumsum() / r.volume.cumsum().replace(0, np.nan)).ffill()
     delta = r.close.diff()
     up = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     dn = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
@@ -231,8 +221,8 @@ def panic_dip(c: Ctx, cfg: Config) -> Optional[Signal]:
     if drop >= cfg.dip_min_drop_pct and was_oversold and heavy and reversal and b.close < b.vwap:
         entry = b.close
         stop = cap_stop(entry, r.low.iloc[-4:].min() * 0.995, cfg)
-        target = b.vwap  # mean-reversion target
-        if target - entry < (entry - stop):  # require at least 1R to VWAP
+        target = b.vwap
+        if target - entry < (entry - stop):
             return None
         return Signal(c.symbol, "PanicDip", entry, stop, target,
                       f"drop {drop:.1f}% RSI<{cfg.rsi_oversold:.0f} reversal candle, target VWAP")
@@ -268,7 +258,6 @@ class Data:
         return out
 
     def universe(self, watchlist: list[str]) -> tuple[list[str], set[str]]:
-        """Fixed seeds + live scan (price < max, volume > 1M). Returns (symbols, scanned)."""
         cfg = self.cfg
         scanned: set[str] = set()
         try:
@@ -334,7 +323,7 @@ class Data:
         ctxs = []
         for s, d in today.items():
             p = self.profiles.get(s)
-            d = d[d.index < cur_min]  # drop the still-forming bar
+            d = d[d.index < cur_min]
             if p is None or d.empty:
                 continue
             rth = d.between_time("09:30", "15:59")
@@ -359,13 +348,6 @@ def px(p: float) -> float:
 class Trader:
     def __init__(self, cfg: Config, tc: TradingClient, dry_run: bool):
         self.cfg, self.tc, self.dry = cfg, tc, dry_run
-        self.done: set[str] = set()     # one trade per symbol per day
-        self.trades_today = 0
-        self.day = None
-
-    def reset_if_new_day(self, d):
-        if self.day != d:
-            self.day, self.done, self.trades_today = d, set(), 0
 
     def daily_loss_hit(self) -> bool:
         a = self.tc.get_account()
@@ -380,7 +362,7 @@ class Trader:
         cfg = self.cfg
         acct = self.tc.get_account()
         equity = float(acct.equity)
-        entry = s.entry * 1.005                      # marketable limit
+        entry = s.entry * 1.005
         stop = min(s.stop, entry - 0.01)
         target = max(s.target, entry + 0.01)
         rps = entry - stop
@@ -393,10 +375,8 @@ class Trader:
         log.info("SIGNAL %s %s qty=%d entry=%.4f stop=%.4f target=%.4f | %s",
                  s.symbol, s.strategy, qty, entry, stop, target, s.reason)
         self._csv(s, qty, entry, stop, target)
-        self.done.add(s.symbol)
         if self.dry:
             return
-        self.trades_today += 1
         self.tc.submit_order(LimitOrderRequest(
             symbol=s.symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
             limit_price=px(entry), order_class=OrderClass.BRACKET,
@@ -425,7 +405,7 @@ class Trader:
             self.tc.close_all_positions(cancel_orders=True)
 
 
-# --------------------------------------------------------------------------- main loop
+# --------------------------------------------------------------------------- main execution
 def load_watchlist(path: Optional[str]) -> list[str]:
     if not path:
         return []
@@ -437,59 +417,54 @@ def run(args):
     load_env()
     key, secret = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
     if not key or not secret:
-        sys.exit("Put ALPACA_API_KEY and ALPACA_SECRET_KEY in a .env file next to this script.")
-    if args.live:
+        sys.exit("Put ALPACA_API_KEY and ALPACA_SECRET_KEY in environment variables or a .env file.")
+    if args.live and not args.no_confirm:
         if input("LIVE TRADING with real money. Type 'I ACCEPT THE RISK' to continue: ") != "I ACCEPT THE RISK":
             sys.exit("Aborted.")
+
     cfg = Config()
     tc = TradingClient(key, secret, paper=not args.live)
     data = Data(key, secret, cfg)
     trader = Trader(cfg, tc, args.dry_run)
     watch = sorted(set(SEEDS) | set(load_watchlist(args.watchlist)))
+
     log.info("Mode: %s%s", "LIVE" if args.live else "PAPER", " (dry-run)" if args.dry_run else "")
 
-    last_universe: tuple[float, list[str], set[str]] = (0.0, [], set())
-    
-      try:
-          clock = tc.get_clock()
-          now = datetime.now(ET)
-          if not clock.is_open:
-              log.info("Market closed. Next open %s", clock.next_open)
-              time.sleep(300)
-              continue
-          trader.reset_if_new_day(now.date())
+    try:
+        clock = tc.get_clock()
+        now = datetime.now(ET)
+        
+        if not clock.is_open:
+            log.info("Market closed. Next open %s. Exiting run.", clock.next_open)
+            return
 
-          if now.time() >= cfg.flatten_at:
-              trader.flatten()
-              time.sleep(600)
-              continue
+        if now.time() >= cfg.flatten_at:
+            trader.flatten()
+            log.info("Past market flatten time. Open positions closed. Exiting run.")
+            return
 
-          if time.time() - last_universe[0] > 300:
-              syms, scanned = data.universe(watch)
-              last_universe = (time.time(), syms, scanned)
-              log.info("Universe (%d, %d scanned): %s", len(syms), len(scanned), ", ".join(syms))
+        syms, scanned = data.universe(watch)
+        log.info("Universe (%d, %d scanned): %s", len(syms), len(scanned), ", ".join(syms))
 
-          if (not trader.daily_loss_hit() and trader.trades_today < cfg.max_trades_per_day):
-              busy = trader.busy_symbols()
-              open_slots = cfg.max_open_positions - len({p.symbol for p in tc.get_all_positions()})
-              for ctx in data.contexts(last_universe[1], now, last_universe[2]):
-                  if open_slots <= 0 or ctx.symbol in busy or ctx.symbol in trader.done:
-                      continue
-                  if ctx.screened and not ctx.rvol >= cfg.screen_min_rvol:
-                      continue  # scanned names must show RVOL > 2; seed names are always eligible
-                  for strat in STRATEGIES:
-                      sig = strat(ctx, cfg)
-                      if sig:
-                          trader.submit(sig)
-                          open_slots -= 1
-                          break
-      except KeyboardInterrupt:
-          log.info("Stopped by user")
-          return
-      except Exception as e:
-          log.exception("loop error: %s", e)
-      # wake a few seconds after the next minute bar closes
-      time.sleep(max(5, 63 - datetime.now().second))
+        if not trader.daily_loss_hit():
+            busy = trader.busy_symbols()
+            open_slots = cfg.max_open_positions - len({p.symbol for p in tc.get_all_positions()})
+            
+            for ctx in data.contexts(syms, now, scanned):
+                if open_slots <= 0 or ctx.symbol in busy:
+                    continue
+                if ctx.screened and not ctx.rvol >= cfg.screen_min_rvol:
+                    continue
+                for strat in STRATEGIES:
+                    sig = strat(ctx, cfg)
+                    if sig:
+                        trader.submit(sig)
+                        open_slots -= 1
+                        break
+
+    except Exception as e:
+        log.exception("Execution error: %s", e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -497,5 +472,6 @@ if __name__ == "__main__":
     ap.add_argument("--live", action="store_true", help="trade real money (default: paper)")
     ap.add_argument("--dry-run", action="store_true", help="log signals only; place no orders")
     ap.add_argument("--watchlist", help="text file with one ticker per line")
+    ap.add_argument("--no-confirm", action="store_true", help="bypass live trading confirmation prompt for automated pipelines")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     run(ap.parse_args())
