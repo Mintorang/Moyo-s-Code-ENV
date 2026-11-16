@@ -12,7 +12,8 @@ Strategies: Gap & Go, VWAP Momentum, Opening Range Breakout, Panic Dip Buy.
 Secrets (GitHub -> Settings -> Secrets and variables -> Actions):
   ALPACA_API_KEY, ALPACA_SECRET_KEY            (repository secrets)
 Optional repo variables: ALPACA_PAPER (default true), DRY_RUN, RISK_PER_TRADE_PCT,
-  MAX_OPEN_POSITIONS, REWARD_RISK, EXTRA_TICKERS (comma separated)
+  MAX_OPEN_POSITIONS, REWARD_RISK, RUN_INTERVAL_MIN (minutes between runs, default 60),
+  EXTRA_TICKERS (comma separated)
 
 Educational software, not financial advice. Profit is NOT guaranteed.
 """
@@ -100,6 +101,11 @@ class Config:
         self.risk_per_trade_pct = env("RISK_PER_TRADE_PCT", self.risk_per_trade_pct)
         self.max_open_positions = env("MAX_OPEN_POSITIONS", self.max_open_positions)
         self.reward_risk = env("REWARD_RISK", self.reward_risk)
+        # Tune timing to how often the workflow runs (minutes between runs)
+        iv = env("RUN_INTERVAL_MIN", 60)
+        self.lookback = int(iv * 1.5 + 5)                      # 10 min -> 20 bars, 60 min -> 95 bars
+        self.stale_entry_minutes = max(10, int(iv * 1.5))      # cancel unfilled entries sooner
+        self.flatten_minutes = 35 if iv >= 30 else 20          # more trading time when polling often
 
 
 @dataclass
