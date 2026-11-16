@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """
-penny_trader.py - Intraday penny-stock bot (Alpaca) with 4 strategies:
+penny_trader.py - ONE-SHOT penny-stock bot for GitHub Actions (runs hourly, then exits).
 
-  1. Gap & Go            gap > 4%, RVOL > 3x, low float; ORB-5 break or VWAP pullback
-  2. VWAP Momentum      cross above VWAP + volume spike + expanding MACD histogram
-  3. Opening Range Breakout (15 min by default) with volume confirmation
-  4. Panic Dip Buy      RSI < 25 on heavy volume, buy first bullish reversal, target VWAP
+Each run: check market clock -> cancel stale entries -> (flatten near the close) ->
+scan seeds + live movers -> look back over the last ~75 minutes of 1-min bars for any
+valid trigger from 4 strategies -> place Alpaca BRACKET orders (stop + target live
+server-side, so exits happen between hourly runs).
 
-SETUP
-  pip install alpaca-py pandas numpy yfinance
-  Create a file named .env next to this script (see .env.example) with your PAPER keys.
+Strategies: Gap & Go, VWAP Momentum, Opening Range Breakout, Panic Dip Buy.
 
-RUN (Scheduled / Single Pass via GitHub Actions)
-  python penny_trader.py --dry-run                    # logs signals only, no orders
-  python penny_trader.py                              # PAPER trading (default)
-  python penny_trader.py --watchlist my_symbols.txt  # add your own tickers (one per line)
-  python penny_trader.py --live                       # REAL money (asks for confirmation)
+Secrets (GitHub -> Settings -> Secrets and variables -> Actions):
+  ALPACA_API_KEY, ALPACA_SECRET_KEY            (repository secrets)
+Optional repo variables: ALPACA_PAPER (default true), DRY_RUN, RISK_PER_TRADE_PCT,
+  MAX_OPEN_POSITIONS, REWARD_RISK, EXTRA_TICKERS (comma separated)
+
+Educational software, not financial advice. Profit is NOT guaranteed.
 """
 from __future__ import annotations
 
-import argparse
 import csv
 import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -46,26 +44,18 @@ from alpaca.trading.requests import (
 )
 
 ET = ZoneInfo("America/New_York")
-OPEN_MOD = 9 * 60 + 30  # minutes since midnight
+OPEN_MOD = 9 * 60 + 30
 log = logging.getLogger("penny")
 
-
-# --------------------------------------------------------------------------- config
 SEED_HIGH_LIQUIDITY = ["PLUG", "OPEN", "NIO", "RIG"]
 SEED_LOW_FLOAT_MOMO = ["SOUN", "BBAI", "RGTI", "SDA", "SNDL"]
 SEED_DIP_BUY = ["ACRS", "STTK", "DBGI"]
 SEEDS = SEED_HIGH_LIQUIDITY + SEED_LOW_FLOAT_MOMO + SEED_DIP_BUY
 
 
-def load_env(path: str = ".env"):
-    """Tiny .env loader so keys never live in the source code."""
-    if os.path.exists(path):
-        with open(path) as f:
-            for ln in f:
-                ln = ln.strip()
-                if ln and not ln.startswith("#") and "=" in ln:
-                    k, v = ln.split("=", 1)
-                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+def env(name: str, default):
+    v = os.getenv(name)
+    return default if v in (None, "") else type(default)(v)
 
 
 @dataclass
@@ -73,7 +63,7 @@ class Config:
     # universe
     min_price: float = 0.50
     max_price: float = 5.00
-    max_universe: int = 40
+    max_scanned: int = 30
     screen_min_volume: int = 1_000_000
     screen_min_rvol: float = 2.0
     # Gap & Go
@@ -91,15 +81,25 @@ class Config:
     rsi_oversold: float = 25.0
     dip_min_drop_pct: float = 8.0
     dip_vol_mult: float = 2.0
+    # hourly-run behaviour
+    lookback: int = 75               # accept triggers from the last N minutes
+    max_chase_pct: float = 3.0       # skip if price already ran >3% past the trigger
+    entry_slip_pct: float = 0.75     # marketable-limit slack so orders actually fill
+    stale_entry_minutes: int = 30    # cancel unfilled entries older than this
+    flatten_minutes: int = 35        # flatten when <= this many minutes to the close
     # risk
     risk_per_trade_pct: float = 0.5
     max_position_pct: float = 10.0
     max_open_positions: int = 3
     max_trades_per_day: int = 6
     daily_loss_limit_pct: float = 3.0
-    reward_risk: float = 2.0
+    reward_risk: float = 1.5
     max_stop_pct: float = 8.0
-    flatten_at: dtime = dtime(15, 50)
+
+    def __post_init__(self):
+        self.risk_per_trade_pct = env("RISK_PER_TRADE_PCT", self.risk_per_trade_pct)
+        self.max_open_positions = env("MAX_OPEN_POSITIONS", self.max_open_positions)
+        self.reward_risk = env("REWARD_RISK", self.reward_risk)
 
 
 @dataclass
@@ -109,6 +109,7 @@ class Signal:
     entry: float
     stop: float
     target: float
+    rvol: float
     reason: str
 
 
@@ -126,7 +127,7 @@ class Ctx:
 def add_indicators(r: pd.DataFrame) -> pd.DataFrame:
     r = r.copy()
     tp = (r.high + r.low + r.close) / 3
-    r["vwap"] = ((tp * r.volume).cumsum() / r.volume.cumsum().replace(0, np.nan)).ffill()
+    r["vwap"] = (tp * r.volume).cumsum() / r.volume.cumsum().replace(0, np.nan)
     delta = r.close.diff()
     up = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     dn = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
@@ -135,101 +136,113 @@ def add_indicators(r: pd.DataFrame) -> pd.DataFrame:
     r["macd_hist"] = macd - macd.ewm(span=9, adjust=False).mean()
     r["vol_avg"] = r.volume.rolling(20, min_periods=5).mean().shift(1)
     r["mod"] = r.index.hour * 60 + r.index.minute
+    r["pos"] = np.arange(len(r))
     return r
 
 
-def float_ok(c: Ctx, cfg: Config) -> bool:
-    return cfg.allow_unknown_float if c.flt is None else c.flt <= cfg.max_float
-
-
-def cap_stop(entry: float, stop: float, cfg: Config) -> float:
-    return max(stop, entry * (1 - cfg.max_stop_pct / 100))
+def last_true(mask: pd.Series, lookback: int) -> Optional[int]:
+    """Position of the most recent True within the last `lookback` bars."""
+    m = mask.fillna(False).astype(bool).iloc[-lookback:]
+    idx = np.flatnonzero(m.values)
+    return len(mask) - len(m) + int(idx[-1]) if len(idx) else None
 
 
 # --------------------------------------------------------------------------- strategies
-def gap_and_go(c: Ctx, cfg: Config) -> Optional[Signal]:
+# each returns (name, trigger_pos, stop, target_or_None, reason) or None
+def gap_and_go(c: Ctx, cfg: Config):
     r = c.rth
-    end = OPEN_MOD + cfg.gap_orb_minutes
-    if c.gap_pct < cfg.gap_min_pct or not c.rvol >= cfg.rvol_min or not float_ok(c, cfg):
+    if c.gap_pct < cfg.gap_min_pct or not c.rvol >= cfg.rvol_min:
         return None
+    if (cfg.allow_unknown_float if c.flt is None else c.flt <= cfg.max_float) is False:
+        return None
+    end = OPEN_MOD + cfg.gap_orb_minutes
     rng = r[r["mod"] < end]
-    if rng.empty or r["mod"].iloc[-1] < end or r["mod"].iloc[-1] > OPEN_MOD + 60:
+    if rng.empty or r["mod"].iloc[-1] < end:
         return None
     hi, lo = rng.high.max(), rng.low.min()
-    a, b = r.iloc[-2], r.iloc[-1]
-    # (a) opening-range breakout
-    if b.close > hi and (r.close.iloc[-4:-1] <= hi).any() and b.close > b.vwap:
-        entry = b.close
-        stop = cap_stop(entry, max(lo, b.vwap * 0.99), cfg)
-        return Signal(c.symbol, "GapAndGo-ORB", entry, stop, entry + cfg.reward_risk * (entry - stop),
-                      f"gap {c.gap_pct:.1f}% rvol {c.rvol:.1f} broke {end - OPEN_MOD}m high {hi:.4f}")
-    # (b) early VWAP pullback after having broken out
-    if (r.high.max() > hi and b.low <= b.vwap * 1.005 and b.close > b.vwap
-            and b.close > b.open and a.close < a.open * 1.02):
-        entry = b.close
-        stop = cap_stop(entry, min(b.low, b.vwap) * 0.995, cfg)
-        return Signal(c.symbol, "GapAndGo-VWAPpullback", entry, stop,
-                      entry + cfg.reward_risk * (entry - stop),
-                      f"gap {c.gap_pct:.1f}% rvol {c.rvol:.1f} VWAP pullback bounce")
-    return None
-
-
-def vwap_momentum(c: Ctx, cfg: Config) -> Optional[Signal]:
-    r = c.rth
-    if len(r) < 35:
+    brk = ((r.close > hi) & (r.close.shift() <= hi) & (r.close > r.vwap)
+           & (r["mod"] >= end) & (r["mod"] <= OPEN_MOD + 90))
+    pb = ((r.low <= r.vwap * 1.005) & (r.close > r.vwap) & (r.close > r.open)
+          & (r.high.cummax().shift() > hi) & (r["mod"] <= OPEN_MOD + 120))
+    i = last_true(brk | pb, cfg.lookback)
+    if i is None:
         return None
-    a, b = r.iloc[-2], r.iloc[-1]
-    crossed = a.close <= a.vwap and b.close > b.vwap
-    spike = pd.notna(b.vol_avg) and b.volume >= cfg.vwap_vol_mult * b.vol_avg
-    macd_up = b.macd_hist > 0 and b.macd_hist > a.macd_hist
-    if crossed and spike and macd_up:
-        entry = b.close
-        stop = cap_stop(entry, min(r.low.iloc[-5:].min(), b.vwap * 0.99), cfg)
-        return Signal(c.symbol, "VWAP-Momentum", entry, stop,
-                      entry + cfg.reward_risk * (entry - stop),
-                      f"VWAP cross, vol {b.volume / b.vol_avg:.1f}x, MACD hist rising")
-    return None
+    row = r.iloc[i]
+    if brk.iloc[i]:
+        return ("GapAndGo-ORB", i, max(lo, row.vwap * 0.99), None,
+                f"gap {c.gap_pct:.1f}% rvol {c.rvol:.1f} broke {hi:.4f}")
+    return ("GapAndGo-VWAPpullback", i, min(row.low, row.vwap) * 0.995, None,
+            f"gap {c.gap_pct:.1f}% rvol {c.rvol:.1f} VWAP pullback")
 
 
-def opening_range_breakout(c: Ctx, cfg: Config) -> Optional[Signal]:
+def orb(c: Ctx, cfg: Config):
     r = c.rth
     end = OPEN_MOD + cfg.orb_minutes
     rng = r[r["mod"] < end]
-    if len(rng) < 3 or r["mod"].iloc[-1] < end or r["mod"].iloc[-1] > 11 * 60 + 30:
+    if len(rng) < 3 or r["mod"].iloc[-1] < end:
         return None
     hi, lo = rng.high.max(), rng.low.min()
-    a, b = r.iloc[-2], r.iloc[-1]
-    spike = pd.notna(b.vol_avg) and b.volume >= cfg.orb_vol_mult * b.vol_avg
-    if b.close > hi and a.close <= hi and spike:
-        entry = b.close
-        stop = cap_stop(entry, lo, cfg)
-        return Signal(c.symbol, f"ORB-{cfg.orb_minutes}", entry, stop,
-                      entry + cfg.reward_risk * (entry - stop),
-                      f"broke {cfg.orb_minutes}m range high {hi:.4f}, vol {b.volume / b.vol_avg:.1f}x")
-    return None
-
-
-def panic_dip(c: Ctx, cfg: Config) -> Optional[Signal]:
-    r = c.rth
-    if len(r) < 20:
+    trig = ((r.close > hi) & (r.close.shift() <= hi)
+            & (r.volume >= cfg.orb_vol_mult * r.vol_avg)
+            & (r["mod"] >= end) & (r["mod"] <= 12 * 60))
+    i = last_true(trig, cfg.lookback)
+    if i is None:
         return None
-    a, b = r.iloc[-2], r.iloc[-1]
-    drop = (r.high.max() - r.low.iloc[-6:].min()) / r.high.max() * 100
-    was_oversold = r.rsi.iloc[-4:-1].min() < cfg.rsi_oversold
-    heavy = ((r.volume.iloc[-6:] >= cfg.dip_vol_mult * r.vol_avg.iloc[-6:]).any())
-    reversal = b.close > b.open and a.close < a.open and b.close > a.close
-    if drop >= cfg.dip_min_drop_pct and was_oversold and heavy and reversal and b.close < b.vwap:
-        entry = b.close
-        stop = cap_stop(entry, r.low.iloc[-4:].min() * 0.995, cfg)
-        target = b.vwap
-        if target - entry < (entry - stop):
-            return None
-        return Signal(c.symbol, "PanicDip", entry, stop, target,
-                      f"drop {drop:.1f}% RSI<{cfg.rsi_oversold:.0f} reversal candle, target VWAP")
+    return (f"ORB-{cfg.orb_minutes}", i, lo, None, f"broke {cfg.orb_minutes}m high {hi:.4f}")
+
+
+def vwap_momentum(c: Ctx, cfg: Config):
+    r = c.rth
+    cross = (r.close.shift() <= r.vwap.shift()) & (r.close > r.vwap)
+    spike = r.volume >= cfg.vwap_vol_mult * r.vol_avg
+    macd_up = (r.macd_hist > 0) & (r.macd_hist > r.macd_hist.shift())
+    i = last_true(cross & spike & macd_up & (r["pos"] >= 30), cfg.lookback)
+    if i is None:
+        return None
+    stop = min(r.low.rolling(5).min().iloc[i], r.vwap.iloc[i] * 0.99)
+    return ("VWAP-Momentum", i, stop, None, "VWAP cross + vol spike + MACD hist rising")
+
+
+def panic_dip(c: Ctx, cfg: Config):
+    r = c.rth
+    hh = r.high.cummax()
+    drop = (hh - r.low.rolling(6).min()) / hh * 100
+    oversold = r.rsi.shift().rolling(3).min() < cfg.rsi_oversold
+    heavy = (r.volume >= cfg.dip_vol_mult * r.vol_avg).astype(float).rolling(6, min_periods=1).max() > 0
+    rev = (r.close > r.open) & (r.close.shift() < r.open.shift()) & (r.close > r.close.shift())
+    trig = (drop >= cfg.dip_min_drop_pct) & oversold & heavy & rev & (r.close < r.vwap) & (r["pos"] >= 20)
+    i = last_true(trig, cfg.lookback)
+    if i is None:
+        return None
+    stop = r.low.rolling(4).min().iloc[i] * 0.995
+    return ("PanicDip", i, stop, float(r.vwap.iloc[-1]), f"drop {drop.iloc[i]:.1f}% RSI<25 reversal, target VWAP")
+
+
+STRATEGIES = [gap_and_go, orb, vwap_momentum, panic_dip]
+
+
+def evaluate(c: Ctx, cfg: Config) -> Optional[Signal]:
+    r = c.rth
+    entry = float(r.close.iloc[-1])
+    for fn in STRATEGIES:
+        out = fn(c, cfg)
+        if not out:
+            continue
+        name, i, stop, target, reason = out
+        if entry > float(r.close.iloc[i]) * (1 + cfg.max_chase_pct / 100):
+            log.info("%s %s trigger found but price already ran > %.1f%%", c.symbol, name, cfg.max_chase_pct)
+            continue
+        stop = max(float(stop), entry * (1 - cfg.max_stop_pct / 100))
+        stop = min(stop, entry * 0.99)               # at least a 1% stop
+        if not stop < entry:
+            continue
+        risk = entry - stop
+        if target is None:
+            target = entry + cfg.reward_risk * risk
+        elif target - entry < risk:                  # need >= 1R to VWAP
+            continue
+        return Signal(c.symbol, name, entry, stop, float(target), c.rvol, reason)
     return None
-
-
-STRATEGIES = [gap_and_go, opening_range_breakout, vwap_momentum, panic_dip]
 
 
 # --------------------------------------------------------------------------- data
@@ -239,104 +252,103 @@ class Data:
         self.hist = StockHistoricalDataClient(key, secret)
         self.screener = ScreenerClient(key, secret)
         self.profiles: dict[str, Optional[dict]] = {}
+        self._floats: dict[str, Optional[float]] = {}
 
-    def bars(self, symbols, start, end, tf=TimeFrame.Minute) -> dict[str, pd.DataFrame]:
-        if not symbols:
-            return {}
-        req = StockBarsRequest(symbol_or_symbols=list(symbols), timeframe=tf,
-                               start=start, end=end, feed=DataFeed.IEX)
-        df = self.hist.get_stock_bars(req).df
-        out = {}
-        if df.empty:
-            return out
-        present = set(df.index.get_level_values(0))
-        for s in symbols:
-            if s in present:
-                d = df.xs(s, level=0).copy()
-                d.index = d.index.tz_convert(ET)
-                out[s] = d
+    def bars(self, symbols, start, end) -> dict[str, pd.DataFrame]:
+        out: dict[str, pd.DataFrame] = {}
+        syms = list(symbols)
+        for k in range(0, len(syms), 40):
+            chunk = syms[k:k + 40]
+            req = StockBarsRequest(symbol_or_symbols=chunk, timeframe=TimeFrame.Minute,
+                                   start=start, end=end, feed=DataFeed.IEX)
+            df = self.hist.get_stock_bars(req).df
+            if df.empty:
+                continue
+            present = set(df.index.get_level_values(0))
+            for s in chunk:
+                if s in present:
+                    d = df.xs(s, level=0).copy()
+                    d.index = d.index.tz_convert(ET)
+                    out[s] = d
         return out
 
-    def universe(self, watchlist: list[str]) -> tuple[list[str], set[str]]:
-        cfg = self.cfg
-        scanned: set[str] = set()
+    def universe(self, seeds: list[str]) -> tuple[list[str], set[str]]:
+        cfg, scanned = self.cfg, set()
         try:
-            movers = self.screener.get_market_movers(MarketMoversRequest(top=50))
-            for g in movers.gainers:
+            for g in self.screener.get_market_movers(MarketMoversRequest(top=50)).gainers:
                 if cfg.min_price <= g.price <= cfg.max_price:
                     scanned.add(g.symbol)
         except Exception as e:
-            log.warning("movers screener unavailable: %s", e)
+            log.warning("movers screener failed: %s", e)
         try:
-            act = self.screener.get_most_actives(MostActivesRequest(by=MostActivesBy.VOLUME, top=50))
-            for a in act.most_actives:
-                if a.volume >= cfg.screen_min_volume:
-                    scanned.add(a.symbol)
+            acts = self.screener.get_most_actives(MostActivesRequest(by=MostActivesBy.VOLUME, top=50))
+            scanned |= {a.symbol for a in acts.most_actives if a.volume >= cfg.screen_min_volume}
         except Exception as e:
-            log.warning("most-actives screener unavailable: %s", e)
-        seeds = set(watchlist)
-        syms = sorted(seeds | scanned)[: cfg.max_universe + len(seeds)]
-        return syms, scanned - seeds
+            log.warning("most-actives screener failed: %s", e)
+        extra = sorted(scanned - set(seeds))[: cfg.max_scanned]
+        return list(seeds) + extra, set(extra)
 
-    @staticmethod
-    def _float(sym: str) -> Optional[float]:
-        try:
-            import yfinance as yf
-            f = yf.Ticker(sym).info.get("floatShares")
-            return float(f) if f else None
-        except Exception:
-            return None
+    def _float(self, sym: str) -> Optional[float]:
+        if sym not in self._floats:
+            try:
+                import yfinance as yf
+                f = yf.Ticker(sym).info.get("floatShares")
+                self._floats[sym] = float(f) if f else None
+            except Exception:
+                self._floats[sym] = None
+        return self._floats[sym]
 
-    def build_profiles(self, syms: list[str], now: datetime):
-        need = [s for s in syms if s not in self.profiles or
-                (self.profiles[s] or {}).get("date") != now.date()]
-        need = [s for s in need if not (s in self.profiles and self.profiles[s] is None)]
+    def _profiles(self, syms, now):
+        need = [s for s in syms if s not in self.profiles]
         if not need:
             return
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        hist = self.bars(need, midnight - timedelta(days=12), midnight)
+        hist = self.bars(need, midnight - timedelta(days=10), midnight)
         for s in need:
             d = hist.get(s)
-            if d is None or d.empty:
+            rth = d.between_time("09:30", "15:59") if d is not None and not d.empty else None
+            if rth is None or rth.empty:
                 self.profiles[s] = None
                 continue
-            d["date"] = d.index.date
-            d["mod"] = d.index.hour * 60 + d.index.minute
+            d = d.assign(date=d.index.date, mod=d.index.hour * 60 + d.index.minute)
             curves = [g.groupby("mod")["volume"].sum().reindex(range(240, 960), fill_value=0).cumsum()
                       for _, g in d.groupby("date")]
-            rth = d.between_time("09:30", "15:59")
-            if rth.empty:
-                self.profiles[s] = None
-                continue
-            self.profiles[s] = {
-                "date": now.date(),
-                "avg_curve": pd.concat(curves, axis=1).mean(axis=1),
-                "prior_close": float(rth.close.iloc[-1]),
-                "float": self._float(s),
-            }
+            self.profiles[s] = {"avg_curve": pd.concat(curves, axis=1).mean(axis=1),
+                                "prior_close": float(rth.close.iloc[-1])}
 
-    def contexts(self, syms: list[str], now: datetime, scanned: set[str] = frozenset()) -> list[Ctx]:
-        self.build_profiles(syms, now)
-        start = now.replace(hour=4, minute=0, second=0, microsecond=0)
-        today = self.bars(syms, start, now)
+    def contexts(self, syms, now, scanned) -> list[Ctx]:
+        cfg = self.cfg
+        self._profiles(syms, now)
+        today = self.bars(syms, now.replace(hour=4, minute=0, second=0, microsecond=0), now)
         cur_min = now.replace(second=0, microsecond=0)
-        ctxs = []
-        for s, d in today.items():
-            p = self.profiles.get(s)
-            d = d[d.index < cur_min]
-            if p is None or d.empty:
+        ctxs, skipped = [], {}
+        for s in syms:
+            p, d = self.profiles.get(s), today.get(s)
+            if p is None:
+                skipped[s] = "no history"
                 continue
+            if d is None or d.empty:
+                skipped[s] = "no bars today"
+                continue
+            d = d[d.index < cur_min]
             rth = d.between_time("09:30", "15:59")
             if len(rth) < 3:
+                skipped[s] = "<3 regular-hours bars"
+                continue
+            price = float(rth.close.iloc[-1])
+            if not cfg.min_price <= price <= cfg.max_price:
+                skipped[s] = f"price ${price:.2f} outside range"
                 continue
             rth = add_indicators(rth)
-            if not (self.cfg.min_price <= rth.close.iloc[-1] <= self.cfg.max_price):
-                continue
-            gap = (rth.open.iloc[0] - p["prior_close"]) / p["prior_close"] * 100
+            gap = (float(rth.open.iloc[0]) - p["prior_close"]) / p["prior_close"] * 100
             mod_now = int(d.index[-1].hour * 60 + d.index[-1].minute)
-            expected = p["avg_curve"].get(mod_now, np.nan)
-            rvol = float(d.volume.sum() / expected) if expected and expected > 0 else float("nan")
-            ctxs.append(Ctx(s, rth, float(gap), rvol, p["float"], s in scanned))
+            exp = p["avg_curve"].get(mod_now, np.nan)
+            rvol = float(d.volume.sum() / exp) if exp and exp > 0 else float("nan")
+            flt = self._float(s) if gap >= cfg.gap_min_pct else None
+            ctxs.append(Ctx(s, rth, gap, rvol, flt, s in scanned))
+            log.info("  %-6s $%.2f gap %+5.1f%% rvol %4.1f bars %d", s, price, gap, rvol, len(rth))
+        if skipped:
+            log.info("Skipped: %s", "; ".join(f"{k} ({v})" for k, v in skipped.items()))
         return ctxs
 
 
@@ -346,132 +358,166 @@ def px(p: float) -> float:
 
 
 class Trader:
-    def __init__(self, cfg: Config, tc: TradingClient, dry_run: bool):
-        self.cfg, self.tc, self.dry = cfg, tc, dry_run
+    def __init__(self, cfg: Config, tc: TradingClient, dry: bool):
+        self.cfg, self.tc, self.dry = cfg, tc, dry
+        self.events: list[str] = []
 
-    def daily_loss_hit(self) -> bool:
-        a = self.tc.get_account()
-        last = float(a.last_equity)
-        pnl = (float(a.equity) - last) / last * 100 if last else 0
-        if pnl <= -self.cfg.daily_loss_limit_pct:
-            log.warning("Daily loss limit hit (%.2f%%) - no new trades", pnl)
-            return True
-        return False
+    def note(self, msg: str):
+        log.info(msg)
+        self.events.append(msg)
 
-    def submit(self, s: Signal):
+    def daily_loss_hit(self, acct) -> bool:
+        last = float(acct.last_equity or 0)
+        pnl = (float(acct.equity) - last) / last * 100 if last else 0
+        self.note(f"Equity ${float(acct.equity):,.2f} (day {pnl:+.2f}%)")
+        return pnl <= -self.cfg.daily_loss_limit_pct
+
+    def cancel_stale_entries(self):
+        now = datetime.now(timezone.utc)
+        for o in self.tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN)):
+            age = (now - o.submitted_at).total_seconds() / 60 if o.submitted_at else 0
+            if o.side == OrderSide.BUY and float(o.filled_qty or 0) == 0 and age > self.cfg.stale_entry_minutes:
+                self.note(f"Cancelling stale unfilled entry {o.symbol} ({age:.0f} min old)")
+                if not self.dry:
+                    try:
+                        self.tc.cancel_order_by_id(o.id)
+                    except Exception as e:
+                        log.warning("cancel failed: %s", e)
+
+    def flatten(self):
+        self.note("Near close: cancelling orders and closing ALL positions")
+        if not self.dry:
+            try:
+                self.tc.close_all_positions(cancel_orders=True)
+            except Exception as e:
+                log.error("flatten failed: %s", e)
+
+    def todays_buys(self) -> set[str]:
+        midnight = datetime.now(ET).replace(hour=0, minute=0, second=0, microsecond=0)
+        orders = self.tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, after=midnight, limit=500))
+        return {o.symbol for o in orders if o.side == OrderSide.BUY}
+
+    def submit(self, s: Signal, acct) -> bool:
         cfg = self.cfg
-        acct = self.tc.get_account()
         equity = float(acct.equity)
-        entry = s.entry * 1.005
-        stop = min(s.stop, entry - 0.01)
-        target = max(s.target, entry + 0.01)
-        rps = entry - stop
-        qty = min(int(equity * cfg.risk_per_trade_pct / 100 / rps),
-                  int(equity * cfg.max_position_pct / 100 / entry),
-                  int(float(acct.buying_power) * 0.95 / entry))
+        limit = s.entry * (1 + cfg.entry_slip_pct / 100)
+        stop = min(s.stop, limit - 0.01)
+        target = max(s.target, limit + 0.01)
+        qty = min(int(equity * cfg.risk_per_trade_pct / 100 / (limit - stop)),
+                  int(equity * cfg.max_position_pct / 100 / limit),
+                  int(float(acct.buying_power) * 0.95 / limit))
         if qty < 1:
-            log.info("%s skipped: size < 1 share", s.symbol)
-            return
-        log.info("SIGNAL %s %s qty=%d entry=%.4f stop=%.4f target=%.4f | %s",
-                 s.symbol, s.strategy, qty, entry, stop, target, s.reason)
-        self._csv(s, qty, entry, stop, target)
+            self.note(f"{s.symbol}: {s.strategy} signal but position size < 1 share")
+            return False
+        self.note(f"BUY {s.symbol} x{qty} limit {px(limit)} stop {px(stop)} target {px(target)} "
+                  f"[{s.strategy}] {s.reason}")
+        self._csv(s, qty, limit, stop, target)
         if self.dry:
-            return
-        self.tc.submit_order(LimitOrderRequest(
-            symbol=s.symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-            limit_price=px(entry), order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=px(target)),
-            stop_loss=StopLossRequest(stop_price=px(stop)),
-        ))
+            return True
+        try:
+            o = self.tc.submit_order(LimitOrderRequest(
+                symbol=s.symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+                limit_price=px(limit), order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=px(target)),
+                stop_loss=StopLossRequest(stop_price=px(stop))))
+            self.note(f"  -> order accepted id={o.id} status={o.status}")
+            return True
+        except Exception as e:
+            self.note(f"  -> ORDER REJECTED for {s.symbol}: {e}")
+            return False
 
-    def _csv(self, s, qty, entry, stop, target):
+    @staticmethod
+    def _csv(s, qty, limit, stop, target):
         new = not os.path.exists("signals.csv")
         with open("signals.csv", "a", newline="") as f:
             w = csv.writer(f)
             if new:
-                w.writerow(["time", "symbol", "strategy", "qty", "entry", "stop", "target", "reason"])
+                w.writerow(["time", "symbol", "strategy", "qty", "limit", "stop", "target", "reason"])
             w.writerow([datetime.now(ET).isoformat(timespec="seconds"), s.symbol, s.strategy,
-                        qty, px(entry), px(stop), px(target), s.reason])
+                        qty, px(limit), px(stop), px(target), s.reason])
 
-    def busy_symbols(self) -> set[str]:
-        held = {p.symbol for p in self.tc.get_all_positions()}
-        orders = self.tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
-        return held | {o.symbol for o in orders}
-
-    def flatten(self):
-        log.info("Flattening all positions and cancelling orders")
-        if not self.dry:
-            self.tc.cancel_orders()
-            self.tc.close_all_positions(cancel_orders=True)
+    def write_summary(self):
+        path = os.getenv("GITHUB_STEP_SUMMARY")
+        if path:
+            with open(path, "a") as f:
+                f.write("### Penny trader run\n" + "\n".join(f"- {e}" for e in self.events) + "\n")
 
 
-# --------------------------------------------------------------------------- main execution
-def load_watchlist(path: Optional[str]) -> list[str]:
-    if not path:
-        return []
-    with open(path) as f:
-        return [ln.strip().upper() for ln in f if ln.strip() and not ln.startswith("#")]
-
-
-def run(args):
-    load_env()
+# --------------------------------------------------------------------------- one run
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     key, secret = os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY")
     if not key or not secret:
-        sys.exit("Put ALPACA_API_KEY and ALPACA_SECRET_KEY in environment variables or a .env file.")
-    if args.live and not args.no_confirm:
-        if input("LIVE TRADING with real money. Type 'I ACCEPT THE RISK' to continue: ") != "I ACCEPT THE RISK":
-            sys.exit("Aborted.")
-
+        log.error("ALPACA_API_KEY / ALPACA_SECRET_KEY missing - add them as GitHub repository secrets.")
+        return 1
+    paper = os.getenv("ALPACA_PAPER", "true").lower() != "false"
+    dry = os.getenv("DRY_RUN", "false").lower() == "true"
     cfg = Config()
-    tc = TradingClient(key, secret, paper=not args.live)
+    tc = TradingClient(key, secret, paper=paper)
+    trader = Trader(cfg, tc, dry)
+    trader.note(f"Mode: {'PAPER' if paper else 'LIVE'}{' (dry-run: no orders sent)' if dry else ''}")
+
+    clock = tc.get_clock()
+    if not clock.is_open:
+        trader.note(f"Market closed (next open {clock.next_open}). Nothing to do.")
+        trader.write_summary()
+        return 0
+    mins_left = (clock.next_close - clock.timestamp).total_seconds() / 60
+    now = datetime.now(ET)
+
+    trader.cancel_stale_entries()
+    if mins_left <= cfg.flatten_minutes:
+        trader.flatten()
+        trader.write_summary()
+        return 0
+
+    acct = tc.get_account()
+    if acct.trading_blocked or acct.account_blocked:
+        trader.note("Account is blocked from trading - check the Alpaca dashboard.")
+        trader.write_summary()
+        return 1
+    if trader.daily_loss_hit(acct):
+        trader.note("Daily loss limit reached - no new trades today.")
+        trader.write_summary()
+        return 0
+    if float(acct.equity) < 25_000 and int(acct.daytrade_count or 0) >= 3:
+        trader.note("PDT limit: 3 day trades used on a <$25k account - skipping new entries.")
+        trader.write_summary()
+        return 0
+
+    bought_today = trader.todays_buys()
+    held = {p.symbol for p in tc.get_all_positions()}
+    open_syms = {o.symbol for o in tc.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))}
+    busy = held | open_syms
+    slots = cfg.max_open_positions - len(busy)
+    room = cfg.max_trades_per_day - len(bought_today)
+    trader.note(f"Positions/open orders: {len(busy)} | buys today: {len(bought_today)} | slots: {max(slots, 0)}")
+    if slots <= 0 or room <= 0:
+        trader.write_summary()
+        return 0
+
+    seeds = sorted(set(SEEDS) | {t.strip().upper() for t in os.getenv("EXTRA_TICKERS", "").split(",") if t.strip()})
     data = Data(key, secret, cfg)
-    trader = Trader(cfg, tc, args.dry_run)
-    watch = sorted(set(SEEDS) | set(load_watchlist(args.watchlist)))
+    syms, scanned = data.universe(seeds)
+    log.info("Universe: %d symbols (%d from scanner)", len(syms), len(scanned))
 
-    log.info("Mode: %s%s", "LIVE" if args.live else "PAPER", " (dry-run)" if args.dry_run else "")
+    signals: list[Signal] = []
+    for ctx in data.contexts(syms, now, scanned):
+        if ctx.symbol in busy or ctx.symbol in bought_today:
+            continue
+        if ctx.screened and not ctx.rvol >= cfg.screen_min_rvol:
+            continue
+        sig = evaluate(ctx, cfg)
+        if sig:
+            signals.append(sig)
 
-    try:
-        clock = tc.get_clock()
-        now = datetime.now(ET)
-        
-        if not clock.is_open:
-            log.info("Market closed. Next open %s. Exiting run.", clock.next_open)
-            return
-
-        if now.time() >= cfg.flatten_at:
-            trader.flatten()
-            log.info("Past market flatten time. Open positions closed. Exiting run.")
-            return
-
-        syms, scanned = data.universe(watch)
-        log.info("Universe (%d, %d scanned): %s", len(syms), len(scanned), ", ".join(syms))
-
-        if not trader.daily_loss_hit():
-            busy = trader.busy_symbols()
-            open_slots = cfg.max_open_positions - len({p.symbol for p in tc.get_all_positions()})
-            
-            for ctx in data.contexts(syms, now, scanned):
-                if open_slots <= 0 or ctx.symbol in busy:
-                    continue
-                if ctx.screened and not ctx.rvol >= cfg.screen_min_rvol:
-                    continue
-                for strat in STRATEGIES:
-                    sig = strat(ctx, cfg)
-                    if sig:
-                        trader.submit(sig)
-                        open_slots -= 1
-                        break
-
-    except Exception as e:
-        log.exception("Execution error: %s", e)
-        sys.exit(1)
+    trader.note(f"Signals found: {len(signals)}")
+    signals.sort(key=lambda s: -(s.rvol if s.rvol == s.rvol else 0))
+    for sig in signals[: min(slots, room)]:
+        trader.submit(sig, acct)
+    trader.write_summary()
+    return 0
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Penny stock strategy bot (Alpaca)")
-    ap.add_argument("--live", action="store_true", help="trade real money (default: paper)")
-    ap.add_argument("--dry-run", action="store_true", help="log signals only; place no orders")
-    ap.add_argument("--watchlist", help="text file with one ticker per line")
-    ap.add_argument("--no-confirm", action="store_true", help="bypass live trading confirmation prompt for automated pipelines")
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    run(ap.parse_args())
+    sys.exit(main())
