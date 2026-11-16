@@ -2,10 +2,9 @@ name: penny-trader
 
 on:
   schedule:
-    # Hourly at :35 UTC covers 9:35 ET onward in both EST and EDT; closed-market runs exit instantly.
-    - cron: "35 13-20 * * 1-5"
-    # Extra late run so positions get flattened ~10 min before the close.
-    - cron: "50 19-20 * * 1-5"
+    # Every 10 minutes, 13:00-20:59 UTC (covers the US session in both EST and EDT).
+    # Runs while the market is closed exit within seconds.
+    - cron: "*/10 13-20 * * 1-5"
   workflow_dispatch:
 
 concurrency:
@@ -36,6 +35,7 @@ jobs:
           RISK_PER_TRADE_PCT: ${{ vars.RISK_PER_TRADE_PCT }}
           MAX_OPEN_POSITIONS: ${{ vars.MAX_OPEN_POSITIONS }}
           REWARD_RISK: ${{ vars.REWARD_RISK }}
+          RUN_INTERVAL_MIN: ${{ vars.RUN_INTERVAL_MIN || '10' }}
           EXTRA_TICKERS: ${{ vars.EXTRA_TICKERS }}
       - uses: actions/upload-artifact@v4
         if: always()
