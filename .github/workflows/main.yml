@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write       # needed for the state branch push
+  contents: write       # needed to push the state/ commit to main
   issues: write         # needed for failure alerting
 
 jobs:
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      # G7: gate the whole job on actual ET time so off-hours runs cost nothing.
+      # Gate the whole job on actual ET time so off-hours runs cost nothing.
       - name: RTH gate (America/New_York)
         id: gate
         run: |
@@ -35,17 +35,9 @@ jobs:
       - name: Checkout main
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
-
-      # G3/G7: data branch holds ledger, float cache, stats. Best-effort —
-      # missing branch is fine, we create it in the commit step below.
-      - name: Checkout state (data branch, best effort)
-        id: state_checkout
-        if: steps.gate.outputs.run == 'true'
-        continue-on-error: true
-        uses: actions/checkout@v4
         with:
-          ref: data
-          path: state
+          persist-credentials: true
+          fetch-depth: 1
 
       - name: Setup Python
         if: steps.gate.outputs.run == 'true'
@@ -82,45 +74,21 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ALPACA_PAPER: ${{ vars.ALPACA_PAPER || 'true' }}
 
-      - name: Commit state
+      - name: Commit state to main
         if: always() && steps.gate.outputs.run == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          mkdir -p state
-          cd state
-
-          # 1. Configure git identity once
+          set -eo pipefail
           git config user.name  "penny-bot"
           git config user.email "penny-bot@users.noreply.github.com"
-
-          # 2. Ensure a local repo on branch `data`, tracking origin/data if it exists
-          if [ ! -d .git ]; then
-            git init -q
-            git checkout -q -b data
-            git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-            # Best-effort: try to adopt an existing remote data branch as parent
-            git fetch --depth=1 origin data 2>/dev/null && \
-              git reset --soft FETCH_HEAD || true
-          fi
-
-          # 3. Stage changes and commit only if there is anything to commit
-          git add -A
+          mkdir -p state
+          git add -A state
           if git diff --cached --quiet; then
             echo "No state changes."
             exit 0
           fi
-          git commit -q -m "state $(date -u +%Y-%m-%dT%H:%MZ) [skip ci]"
-
-          # 4. Push. If the branch doesn't exist on the remote, this creates it.
-          #    If it exists and we're behind, rebase then push.
-          if ! git push -q origin data; then
-            echo "Push failed; attempting rebase onto origin/data"
-            git fetch --depth=1 origin data
-            git rebase -q FETCH_HEAD
-            git push -q origin data
-          fi
+          git commit -m "state $(date -u +%Y-%m-%dT%H:%MZ) [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
 
       - uses: actions/upload-artifact@v4
         if: always()
