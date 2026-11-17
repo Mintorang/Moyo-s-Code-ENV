@@ -84,22 +84,42 @@ jobs:
 
       - name: Commit state
         if: always() && steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           mkdir -p state
           cd state
-          if [ ! -d .git ]; then
-            git init -b data
-            git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          fi
+
+          # 1. Configure git identity once
           git config user.name  "penny-bot"
           git config user.email "penny-bot@users.noreply.github.com"
+
+          # 2. Ensure a local repo on branch `data`, tracking origin/data if it exists
+          if [ ! -d .git ]; then
+            git init -q
+            git checkout -q -b data
+            git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+            # Best-effort: try to adopt an existing remote data branch as parent
+            git fetch --depth=1 origin data 2>/dev/null && \
+              git reset --soft FETCH_HEAD || true
+          fi
+
+          # 3. Stage changes and commit only if there is anything to commit
           git add -A
-          if ! git diff --cached --quiet; then
-            git commit -m "state $(date -u +%Y-%m-%dT%H:%MZ) [skip ci]"
-            git push -u origin data || (git pull --rebase origin data && git push origin data)
-          else
+          if git diff --cached --quiet; then
             echo "No state changes."
+            exit 0
+          fi
+          git commit -q -m "state $(date -u +%Y-%m-%dT%H:%MZ) [skip ci]"
+
+          # 4. Push. If the branch doesn't exist on the remote, this creates it.
+          #    If it exists and we're behind, rebase then push.
+          if ! git push -q origin data; then
+            echo "Push failed; attempting rebase onto origin/data"
+            git fetch --depth=1 origin data
+            git rebase -q FETCH_HEAD
+            git push -q origin data
           fi
 
       - uses: actions/upload-artifact@v4
