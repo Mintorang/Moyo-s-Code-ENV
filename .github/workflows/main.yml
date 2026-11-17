@@ -2,9 +2,10 @@ name: penny-trader
 
 on:
   schedule:
-    # Every 10 minutes, 13:00-20:59 UTC (covers the US session in both EST and EDT).
-    # Runs while the market is closed exit within seconds.
-    - cron: "*/10 13-20 * * 1-5"
+    # Hourly at :35 UTC, weekdays. Covers both EST (14:30) and EDT (13:30) opens.
+    # The RTH gate below exits fast when the market is closed, so the wasted
+    # runtime is a single `date` call — not a pip install.
+    - cron: "35 13-20 * * 1-5"
   workflow_dispatch:
 
 concurrency:
@@ -12,20 +13,53 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write       # needed for the state branch push
+  issues: write         # needed for failure alerting
 
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # G7: gate the whole job on actual ET time so off-hours runs cost nothing.
+      - name: RTH gate (America/New_York)
+        id: gate
+        run: |
+          T=$(TZ=America/New_York date +%H%M)
+          if [ "$T" -ge 0925 ] && [ "$T" -le 1605 ]; then
+            echo run=true >> "$GITHUB_OUTPUT"
+          else
+            echo run=false >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout main
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/checkout@v4
+
+      # G3/G7: data branch holds ledger, float cache, stats. Best-effort —
+      # missing branch is fine, we create it in the commit step below.
+      - name: Checkout state (data branch, best effort)
+        id: state_checkout
+        if: steps.gate.outputs.run == 'true'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: state
+
+      - name: Setup Python
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements.txt
-      - name: Run strategies once
+
+      - name: Install deps
+        if: steps.gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run strategies
+        if: steps.gate.outputs.run == 'true'
         run: python penny_trader.py
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -35,11 +69,52 @@ jobs:
           RISK_PER_TRADE_PCT: ${{ vars.RISK_PER_TRADE_PCT }}
           MAX_OPEN_POSITIONS: ${{ vars.MAX_OPEN_POSITIONS }}
           REWARD_RISK: ${{ vars.REWARD_RISK }}
-          RUN_INTERVAL_MIN: ${{ vars.RUN_INTERVAL_MIN || '10' }}
+          RUN_INTERVAL_MIN: ${{ vars.RUN_INTERVAL_MIN || '60' }}
+          MIN_BAR_DENSITY: ${{ vars.MIN_BAR_DENSITY || '0.6' }}
+          MIN_VOLUME_FOR_RVOL: ${{ vars.MIN_VOLUME_FOR_RVOL || '10000' }}
           EXTRA_TICKERS: ${{ vars.EXTRA_TICKERS }}
+
+      - name: Update P&L ledger
+        if: steps.gate.outputs.run == 'true'
+        run: python monitor.py
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          ALPACA_PAPER: ${{ vars.ALPACA_PAPER || 'true' }}
+
+      - name: Commit state
+        if: always() && steps.gate.outputs.run == 'true'
+        run: |
+          set -e
+          mkdir -p state
+          cd state
+          if [ ! -d .git ]; then
+            git init -b data
+            git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          fi
+          git config user.name  "penny-bot"
+          git config user.email "penny-bot@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "state $(date -u +%Y-%m-%dT%H:%MZ) [skip ci]"
+            git push -u origin data || (git pull --rebase origin data && git push origin data)
+          else
+            echo "No state changes."
+          fi
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: signals-${{ github.run_id }}
           path: signals.csv
-          if-no-files-found: ignore
+          if-no-files-found: warn
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "penny-trader failed $(date -u +%Y-%m-%dT%H:%MZ)" \
+            --body "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --label "bot-failure" || true
