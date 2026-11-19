@@ -2,9 +2,8 @@ name: penny-trader
 
 on:
   schedule:
-    # Hourly at :35 UTC, weekdays. Covers both EST (14:30) and EDT (13:30) opens.
-    # The RTH gate below exits fast when the market is closed, so the wasted
-    # runtime is a single `date` call — not a pip install.
+    # Hourly at :35 UTC, weekdays. This covers 9:35-3:35 p.m.
+    # America/New_York in both EST and EDT; the gate below checks local time.
     - cron: "35 13-20 * * 1-5"
   workflow_dispatch:
 
@@ -13,23 +12,34 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write       # needed to push the state/ commit to main
-  issues: write         # needed for failure alerting
+  contents: write
+  issues: write
 
 jobs:
   trade:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
     steps:
-      # Gate the whole job on actual ET time so off-hours runs cost nothing.
       - name: RTH gate (America/New_York)
         id: gate
+        shell: bash
         run: |
-          T=$(TZ=America/New_York date +%H%M)
-          if [ "$T" -ge 0925 ] && [ "$T" -le 1605 ]; then
-            echo run=true >> "$GITHUB_OUTPUT"
+          echo "UTC: $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "New York: $(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          DOW=$(TZ=America/New_York date +%u)
+          HOUR=$(TZ=America/New_York date +%H)
+          MINUTE=$(TZ=America/New_York date +%M)
+          NOW_MIN=$((10#$HOUR * 60 + 10#$MINUTE))
+
+          # Allow weekday runs from 9:25 a.m. until 4:00 p.m. ET.
+          if [ "$DOW" -le 5 ] && [ "$NOW_MIN" -ge 565 ] && [ "$NOW_MIN" -lt 960 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Inside the weekday trading-hours window."
           else
-            echo run=false >> "$GITHUB_OUTPUT"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Outside the weekday trading-hours window; trading steps will be skipped."
           fi
 
       - name: Checkout main
@@ -78,7 +88,7 @@ jobs:
         if: always() && steps.gate.outputs.run == 'true'
         run: |
           set -eo pipefail
-          git config user.name  "penny-bot"
+          git config user.name "penny-bot"
           git config user.email "penny-bot@users.noreply.github.com"
           mkdir -p state
           git add -A state
